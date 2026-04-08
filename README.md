@@ -1,2 +1,2 @@
-# scRNAseq_muscat_workshop
-Workshop on using muscat on example single cell RNA-Seq data
+# scRNAseq_DE_workshop
+Workshop on performing differential expression on single cell RNA-Seq data using muscat workflow
