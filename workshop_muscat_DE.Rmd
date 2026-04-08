@@ -40,8 +40,6 @@ library(pheatmap)
 library(ggrepel)
 ```
 
----
-
 # Load example data
 
 ```{r load-data}
@@ -125,8 +123,6 @@ dim(assay(pb, 1))
 # Look at the pseudobulk count matrix for the first cell type
 assay(pb, 1)[1:5, 1:5]
 ```
-
----
 
 # Step 3: Quality control on pseudobulk
 
