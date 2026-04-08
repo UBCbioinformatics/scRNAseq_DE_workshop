@@ -1,0 +1,327 @@
+---
+title: "Bioinformatics workshop scRNA-seq DE"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+# Setup
+
+## Install packages
+
+```{r install, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install(c("muscat", "DESeq2", "SingleCellExperiment", "scater", "edgeR"))
+install.packages(c("ggplot2", "dplyr", "pheatmap", "ggrepel"))
+```
+
+## Load libraries
+
+```{r libraries}
+library(muscat)
+library(ExperimentHub)
+library(SingleCellExperiment)
+library(scater)
+library(edgeR)
+library(ggplot2)
+library(dplyr)
+library(pheatmap)
+library(ggrepel)
+```
+
+---
+
+# Load example data
+
+```{r load-data}
+# ExperimentHub is a bioconductor service that hosts and distributes curated datasets
+# Can be queried by accession IDs
+eh <- ExperimentHub()
+sce <- eh[["EH2259"]]
+
+# Inspect the object
+sce
+```
+
+```{r explore-data}
+# Available metadata
+head(colData(sce))
+
+# cell — cell type label (e.g., "B cells", "CD14+ Monocytes")
+# ind — donor/individual ID (e.g., 107, 1016, 1256)
+# stim — condition ("ctrl" or "stim")
+# cluster — numeric cluster ID from the original clustering
+# multiplets — whether the cell is a "singlet" or "doublet" (two cells captured together)
+
+# Cell type labels
+table(sce$cell)
+
+# Sample IDs
+table(sce$ind)
+
+# Condition (group)
+table(sce$stim)
+
+# Cross-tabulation: cells per sample × cell type
+table(sce$cell, sce$ind)
+```
+
+# Step 1: Prepare the SCE object
+
+```{r prep-sce}
+# Create unique sample ID per donor × condition
+sce$sample <- paste0(sce$ind, "_", sce$stim)
+# The EH2259 data already uses muscat's standard column names,
+# but we still run prepSCE to set up internal metadata (experiment_info)
+sce <- prepSCE(sce,
+  kid = "cell", #your cluster column cluster_id (e.g., from Seurat clustering or manual annotation)
+  sid = "sample", #your sample column sample_id (biological replicate / donor)
+  gid = "stim") #your group column group_id (e.g., "healthy" vs. "disease")
+sce <- logNormCounts(sce)
+head(colData(sce)[, c("cluster_id", "sample_id", "group_id")])
+```
+
+```{r prep-summary}
+# Quick summary of the experimental design
+nlevels(sce$cluster_id)  # number of cell types
+nlevels(sce$sample_id)   # number of samples
+nlevels(sce$group_id)    # number of conditions
+levels(sce$group_id)     # condition labels
+
+# Cells per cluster × sample
+table(sce$cluster_id, sce$sample_id)
+```
+
+# Step 2: Aggregate to pseudobulk
+
+```{r aggregate}
+# sums the raw counts for each gene across all cells belonging to the same cluster × sample combination. This creates one pseudobulk profile per biological replicate per cell type
+pb <- aggregateData(sce,
+  assay = "counts",   # use raw counts
+  fun = "sum",        # sum (not mean!) — edgeR/DESeq2 expect counts
+  by = c("cluster_id", "sample_id"))
+
+pb
+```
+
+```{r aggregate-inspect}
+# One assay per cell type
+assayNames(pb)
+
+# Dimensions of first cell type: genes × samples
+dim(assay(pb, 1))
+
+# Look at the pseudobulk count matrix for the first cell type
+assay(pb, 1)[1:5, 1:5]
+```
+
+---
+
+# Step 3: Quality control on pseudobulk
+
+## MDS plot
+
+```{r mds-plot, fig.width=10, fig.height=6}
+# Before running DE, it is important to check whether samples separate by condition rather than by unwanted factors (batch, donor)
+pbMDS(pb)
+# Samples from the same condition should cluster together. If samples cluster by batch or donor instead, you may need to include covariates in the design
+```
+## Cell counts per group
+
+```{r cell-counts, fig.width=10, fig.height=5}
+# Visualize the number of cells contributing to each pseudobulk profile
+cd <- as.data.frame(colData(sce))
+raw_cd = cd %>%
+  group_by(cluster_id, sample_id, group_id) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  ggplot(aes(x = sample_id, y = n, fill = group_id)) +
+  geom_col() +
+  facet_wrap(~ cluster_id, scales = "free_y") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = "Number of cells", x = "Sample", fill = "Condition")
+raw_cd
+# Visualize the proportions contributing to each pseudobulk profile
+pro_cd = cd %>%
+  group_by(cluster_id, sample_id, group_id) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(sample_id) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = sample_id, y = prop, fill = group_id)) +
+  geom_col() +
+  facet_wrap(~ cluster_id, scales = "free_y") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = "Proportion", x = "Sample", fill = "Condition")
+pro_cd
+```
+
+# Step 4: Run differential state analysis
+
+```{r run-de}
+# Runs pseudobulk DE analysis for each cell type independently. By default, it uses **edgeR** with the quasi-likelihood F-test (QLF)
+res <- pbDS(pb, verbose = FALSE)
+```
+
+```{r extract-results}
+# Extract tidy results table (all cell types combined)
+tbl <- resDS(sce, res, bind = "row")
+
+# gene       — gene name
+# cluster_id — cell type
+# logFC      — log2 fold change (stim vs ctrl)
+# logCPM     — average log2 counts per million
+# F          — F-statistic (edgeR QLF)
+# p_val      — raw p-value
+# p_adj.loc  — FDR adjusted within each cluster
+# p_adj.glb  — FDR adjusted globally (across all clusters)
+
+# Inspect the results
+head(tbl)
+```
+
+```{r results-summary}
+# Genes tested per cell tested
+tbl %>%
+  group_by(cluster_id) %>%
+  summarise(
+    n_tested = n(),
+    n_sig_local = sum(p_adj.loc < 0.05, na.rm = TRUE),
+    n_sig_global = sum(p_adj.glb < 0.05, na.rm = TRUE)
+  )
+```
+
+## Filter significant genes
+
+```{r filter-sig}
+# Significant DE genes: FDR < 0.05 and |logFC| > 1
+# p_adj.loc - FDR correction applied *within* each cluster. Use this if you are interested in a specific cell type.
+# p_adj.glb - FDR correction applied *across all clusters*. More conservative; use this when comparing results across cell types simultaneously.
+
+tbl_sig <- tbl %>%
+  filter(p_adj.loc < 0.05, abs(logFC) > 1)
+
+# Summary per cell type
+tbl_sig %>%
+  group_by(cluster_id) %>%
+  summarise(
+    n_up   = sum(logFC > 0),
+    n_down = sum(logFC < 0),
+    n_total = n()
+  ) %>%
+  arrange(desc(n_total))
+```
+
+# Step 5: Visualize results
+
+## Volcano plot
+
+```{r volcano, fig.width=7, fig.height=5}
+# cell type of interest
+ct <- "B cells"
+
+df_volcano <- tbl %>%
+  filter(cluster_id == ct) %>%
+  mutate(
+    sig = p_adj.loc < 0.05 & abs(logFC) > 1,
+    label = ifelse(sig & rank(-abs(logFC)) <= 10, gene, NA)
+  )
+
+ggplot(df_volcano, aes(x = logFC, y = -log10(p_val), color = sig)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c("grey60", "#E85D5D"), labels = c("NS", "Sig")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 15, color = "black") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = paste0("Volcano Plot: ", ct),
+    subtitle = "Stimulated vs. Control",
+    x = "log2 Fold Change",
+    y = "-log10(p-value)",
+    color = "Significant"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+## Heatmap of top DE genes
+
+```{r heatmap, fig.width=10, fig.height=7}
+# Built-in muscat heatmap — top 20 DE genes per cluster
+pbHeatmap(sce, res, top_n = 20)
+```
+
+## Expression frequency plot
+
+```{r freq-plot, fig.width=8, fig.height=5}
+# For a specific cluster, plot the fraction of cells expressing top DE genes
+top_genes <- tbl_sig %>%
+  filter(cluster_id == ct) %>%
+  arrange(p_adj.loc) %>%
+  head(10) %>%
+  pull(gene)
+
+plotExpression(sce[, which(sce$cluster_id == ct)], #drop cells with NAs samples
+  features = top_genes,
+  x = "group_id",
+  colour_by = "group_id") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Number of DE genes across cell types
+
+```{r bar-de, fig.width=8, fig.height=4}
+de_summary <- tbl_sig %>%
+  mutate(direction = ifelse(logFC > 0, "Up", "Down")) %>%
+  group_by(cluster_id, direction) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(de_summary, aes(x = reorder(cluster_id, n), y = n, fill = direction)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Up" = "#E85D5D", "Down" = "#4ECDC4")) +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "DE Genes per Cell Type",
+    x = NULL,
+    y = "Number of DE genes (FDR < 0.05, |logFC| > 1)",
+    fill = "Direction"
+  )
+```
+
+# Alternative DE methods
+
+```{r alt-methods, eval=FALSE}
+# DESeq2
+res_deseq2 <- pbDS(pb, method = "DESeq2", verbose = FALSE)
+
+# limma-voom
+res_limma <- pbDS(pb, method = "limma-voom", verbose = FALSE)
+```
+
+# Adding covariates
+
+```{r covariates, eval=FALSE}
+# Example: include batch as a covariate
+# Ensure batch info is in colData of the pseudobulk object
+# Kang data has no batch variables
+pb$batch <- metadata_table$batch[match(pb$sample_id, metadata_table$sample_id)]
+
+# Custom design matrix
+design <- model.matrix(~ 0 + group_id + batch, data = colData(pb))
+contrast <- makeContrasts(group_idstim - group_idctrl, levels = design)
+
+res_adj <- pbDS(pb, design = design, contrast = contrast, verbose = FALSE)
+```
+
